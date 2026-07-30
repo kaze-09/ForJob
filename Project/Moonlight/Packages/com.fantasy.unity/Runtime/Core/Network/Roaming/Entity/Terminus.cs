@@ -1,0 +1,646 @@
+#if FANTASY_NET
+using System.Runtime.CompilerServices;
+using Fantasy.Async;
+using Fantasy.Entitas;
+using Fantasy.InnerMessage;
+using Fantasy.Network.Interface;
+using Fantasy.Serialize;
+using LightProto;
+using MemoryPack;
+// ReSharper disable UnassignedField.Global
+// ReSharper disable ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+// ReSharper disable CheckNamespace
+#pragma warning disable CS8600 // Converting null literal or possible null value to non-nullable type.
+#pragma warning disable CS8618 // Non-nullable field must contain a non-null value when exiting constructor. Consider adding the 'required' modifier or declaring as nullable.
+#pragma warning disable CS8603 // Possible null reference return.
+namespace Fantasy.Network.Roaming;
+
+/// <summary>
+/// 漫游终端实体
+/// </summary>
+[MemoryPackable]
+public sealed partial class Terminus : Entity
+{
+    /// <summary>
+    /// 当前漫游终端的TerminusId。
+    /// 可以通过 TerminusId 发送消息给这个漫游终端。
+    /// 也可以理解为实体的RuntimeId。
+    /// </summary>
+    internal long TerminusId;
+    /// <summary>
+    /// 标记是否销毁过Terminus
+    /// </summary>
+    internal bool IsDisposeTerminus;
+    /// <summary>
+    /// 当前漫游终端的类型。
+    /// </summary>
+    public int RoamingType { get; internal set; }
+    /// <summary>
+    /// 漫游转发Session所在的Scene的Address。
+    /// </summary>
+    public long ForwardSceneAddress{ get; internal set; }
+    /// <summary>
+    /// 漫游转发Session的Address。
+    /// 不知道原理千万不要手动赋值这个。
+    /// </summary>
+    public long ForwardSessionAddress{ get; internal set; }
+    /// <summary>
+    /// 标记是否在Terminus销毁的时候自动销毁关联的 Entity
+    /// </summary>
+    public bool IsAutoDisposeLinkTerminusEntity { get; internal set; }
+    /// <summary>
+    /// 关联的玩家实体
+    /// </summary>
+    public Entity? TerminusEntity { get; private set; }
+    /// <summary>
+    /// 漫游消息锁。
+    /// </summary>
+    [ProtoIgnore]
+    [MemoryPackIgnore]
+    internal CoroutineLock? RoamingMessageLock;
+    /// <summary>
+    /// 是否停止发送转发代码到Roaming
+    /// </summary>
+    [ProtoIgnore]
+    [MemoryPackIgnore]
+    internal bool StopForwarding;
+    /// <summary>
+    /// 存放其他漫游终端的Id。
+    /// 通过这个Id可以发送消息给它。
+    /// </summary>
+    [ProtoIgnore]
+    [MemoryPackIgnore]
+    private readonly Dictionary<int, long> _roamingTerminusId = new Dictionary<int, long>();
+
+    /// <summary>
+    /// 销毁
+    /// </summary>
+    public override void Dispose()
+    {
+        if (IsDisposed || IsDisposeTerminus)
+        {
+            return;
+        }
+        
+        DisposeAsync(DisposeTerminusType.UnLink).Coroutine();
+    }
+
+    internal async FTask DisposeAsync(DisposeTerminusType disposeTerminusType)
+    {
+        if (IsDisposed || IsDisposeTerminus)
+        {
+            return;
+        }
+        
+        IsDisposeTerminus = true;
+
+        try
+        {
+            await Scene.TerminusComponent.RemoveTerminusAsync(disposeTerminusType, Id, false);
+        }
+        finally
+        {
+            TerminusId = 0;
+            RoamingType = 0;
+            ForwardSceneAddress = 0;
+            ForwardSessionAddress = 0;
+        
+            TerminusEntity = null;
+            IsAutoDisposeLinkTerminusEntity = false;
+
+            try
+            {
+                RoamingMessageLock?.Dispose();
+            }
+            catch (Exception e)
+            {
+                Log.Error(e);
+            }
+            finally
+            {
+                RoamingMessageLock = null;
+                _roamingTerminusId.Clear();
+                base.Dispose();
+            }
+        }
+    }
+
+    #region Link
+
+    /// <summary>
+    /// 创建并关联一个终端实体。
+    /// 关联后，所有发送给 Terminus 的消息将转由该实体处理。
+    /// 注意：销毁关联实体不会自动销毁 Terminus，需通过 autoDispose 参数控制生命周期。
+    /// </summary>
+    /// <param name="autoDispose">Terminus 销毁时是否自动销毁该关联实体</param>
+    /// <param name="startForwarding">是否开启消息转发到客户端</param>
+    /// <typeparam name="T">要创建的实体类型</typeparam>
+    /// <returns>创建的实体实例，如果已存在关联实体则返回 null</returns>
+    public async FTask<T> LinkTerminusEntity<T>(bool autoDispose, bool startForwarding = true) where T : Entity, new()
+    {
+        if (!IsCanLink())
+        {
+            return null;
+        }
+
+        var linkEntity = Entity.Create<T>(Scene, true, true);
+        await LinkEntity(linkEntity, autoDispose);
+        StopForwarding = !startForwarding;
+        return linkEntity;
+    }
+
+    /// <summary>
+    /// 关联一个已存在的实体到此终端。
+    /// 关联后，所有发送给 Terminus 的消息将转由该实体处理。
+    /// 注意：销毁关联实体不会自动销毁 Terminus，需通过 autoDispose 参数控制生命周期。
+    /// </summary>
+    /// <param name="entity">要关联的实体</param>
+    /// <param name="autoDispose">Terminus 销毁时是否自动销毁该关联实体</param>
+    /// <param name="startForwarding"></param>
+    public async FTask LinkTerminusEntity(Entity entity, bool autoDispose, bool startForwarding = true)
+    {
+        if (entity == null)
+        {
+            Log.Error("Entity cannot be empty");
+            return;
+        }
+        
+        if (!IsCanLink())
+        {
+            return;
+        }
+        
+        // 如果需要关联的实体已经关联过其他实体
+        
+        var terminusFlagComponent = entity.GetComponent<TerminusFlagComponent>();
+        
+        if (terminusFlagComponent != null)
+        {
+            Terminus terminus = terminusFlagComponent.Terminus;
+            
+            if (terminus != null)
+            {
+                Log.Error($"Entity {entity.Id} is already linked to Terminus {terminus.Id}");
+                return;
+            }
+            else
+            {
+                // 如果关联的Terminus已经销毁了那就删除掉就可以了
+                // 因为这情况不会影响逻辑，一般是在Terminus已经断开了
+                // 这个情况是允许的
+                entity.RemoveComponent<TerminusFlagComponent>();
+            }
+        }
+
+        await LinkEntity(entity, autoDispose);
+        StopForwarding = !startForwarding;
+    }
+
+    private async FTask LinkEntity(Entity entity, bool autoDispose)
+    {
+        var isLocked = false;
+        var syncRoaming = TerminusId != 0;
+        var entityRuntimeId = entity.RuntimeId;
+        
+        IsAutoDisposeLinkTerminusEntity =  autoDispose;
+        
+        try
+        {
+            if (syncRoaming)
+            {
+                // 连接之前要先锁定避免中间会有消息发送
+                var lockErrorCode = await Lock();
+
+                if (lockErrorCode != 0)
+                {
+                    // 锁定失败，关联实体操作中止
+                    Log.Error($"Failed to lock Terminus {Id} before linking entity. ErrorCode: {lockErrorCode}. Link operation aborted.");
+                    return;
+                }
+            }
+
+            isLocked = true;
+            TerminusEntity = entity;
+            TerminusId = entityRuntimeId;
+            
+            SetTerminusFlag(entity);
+
+            if (syncRoaming)
+            {
+                // 操作完成执行解锁
+                await UnLock();
+            }
+            
+            isLocked = false;
+        }
+        catch (Exception e)
+        {
+            Log.Error(e);
+            
+            if (syncRoaming && isLocked)
+            {
+                await UnLock();
+            }
+        }
+    }
+    
+    private bool IsCanLink()
+    {
+        // 如果TerminusEntity存在，表示已经关联过Entity
+        
+        if (TerminusEntity != null)
+        {
+            Log.Error($"TerminusEntity:{TerminusEntity.Type.FullName} Already exists!");
+            return false;
+        }
+        
+        // 如果当前已经挂载了TerminusEntityFlagComponent表示以前连接到某个实体
+        
+        var terminusEntityFlagComponent = GetComponent<TerminusEntityFlagComponent>();
+
+        if (terminusEntityFlagComponent == null)
+        {
+            return true;
+        }
+        
+        Entity linkEntity = terminusEntityFlagComponent.LinkEntity;
+
+        if (linkEntity != null)
+        {
+            Log.Error($"TerminusEntity:{linkEntity.Type.FullName} Already exists!");
+            return false;
+        }
+        
+        // 如果当前关联过的实体已经被销毁了
+        // 正常情况是不会出现这个问题的如果有加打印一个警告出来便于后期维护
+        Log.Warning($"Terminus {Id} has TerminusEntityFlagComponent but LinkEntity is null. This should not happen normally. The linked entity may have been disposed without properly cleaning up the Terminus relationship. Cleaning up orphaned component.");
+        RemoveComponent<TerminusEntityFlagComponent>();
+        return true;
+    }
+
+    /// <summary>
+    /// 设置转发，true 为开启转发，false 为停止转发
+    /// </summary>
+    /// <param name="isStartForwarding"></param>
+    public void SetForwarding(bool isStartForwarding)
+    {
+        StopForwarding = !isStartForwarding;
+    }
+
+    #endregion
+
+    #region Transfer
+
+    /// <summary>
+    /// 传送漫游终端
+    /// 传送完成后，漫游终端和关联的玩家实体都会被销毁。
+    /// 所以如果有其他组件关联这个实体，要提前记录好Id，方便传送后清理。
+    /// </summary>
+    /// <returns></returns>
+    public async FTask<uint> StartTransfer(long targetSceneAddress)
+    {
+        var currentSceneAddress = Scene.Address;
+        
+        if (targetSceneAddress == currentSceneAddress)
+        {
+            Log.Warning($"Unable to teleport to your own scene targetSceneAddress:{targetSceneAddress} == currentSceneAddress:{currentSceneAddress}");
+            return 0;
+        }
+        
+        var isLocked = false;
+        
+        try
+        {
+            // 传送目标服务器之前要先锁定，防止再传送过程中还有其他消息发送过来。
+            var lockErrorCode = await Lock();
+            if (lockErrorCode != 0)
+            {
+                Log.Error($"Failed to lock Terminus {Id} before transfer. ErrorCode: {lockErrorCode}");
+                return lockErrorCode;
+            }
+            isLocked = true;
+            
+            // 执行传送前的事件
+            if (this.TerminusEntity == null)
+            {
+                await Scene.EntityComponent.TransferOut(this);
+            }
+            else
+            {
+                await Scene.EntityComponent.TransferOut(TerminusEntity);
+            }
+            
+            // 开始执行传送请求。
+            using var response = (I_TransferTerminusResponse)await Scene.NetworkMessagingComponent.Call(
+                targetSceneAddress,
+                new I_TransferTerminusRequest()
+                {
+                    Terminus = this
+                });
+            if (response.ErrorCode != 0)
+            {
+                // 如果传送出现异常，需要先解锁，不然会出现一直卡死的问题。
+                await UnLock();
+                isLocked = false;
+                return response.ErrorCode;
+            }
+            // 在当前Scene下移除漫游终端。
+            await Scene.TerminusComponent.RemoveTerminusAsync(DisposeTerminusType.Transfer, Id, true);
+        }
+        catch (Exception e)
+        {
+            Log.Error(e);
+            
+            // 如果代码执行出现任何异常，要先去解锁，避免会出现卡死的问题。
+            if (isLocked)
+            {
+                await UnLock();
+            }
+            
+            return InnerErrorCode.ErrTerminusStartTransfer;
+        }
+
+        return 0;
+    }
+
+    /// <summary>
+    /// 设置Terminus和LinkEntity的FlagComponent
+    /// 用于方便的找到对方
+    /// </summary>
+    /// <param name="entity"></param>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void SetTerminusFlag(Entity entity)
+    {
+        // 给当前实体添加组件用来代表是已经关联了Terminus
+            
+        entity.AddComponent<TerminusFlagComponent>().Terminus = this;
+            
+        // 只有IsAutoDisposeLinkTerminusEntity = true的时候当前Terminus添加组件来代表已经关联了Entity
+            
+        if (IsAutoDisposeLinkTerminusEntity)
+        {
+            AddComponent<TerminusEntityFlagComponent>().LinkEntity = entity;
+        }
+    }
+
+    /// <summary>
+    /// 传送完成。
+    /// 当传送完成后，需要清理漫游终端。
+    /// </summary>
+    /// <returns></returns>
+    internal async FTask<uint> TransferComplete(Scene scene)
+    {
+        // 首先恢复漫游终端的序列化数据。并且注册到框架中。
+        // 并执行传送后的组件事件
+        
+        Deserialize(scene);
+        TerminusId = RuntimeId;
+        
+        if (TerminusEntity != null)
+        {
+            TerminusEntity.Deserialize(scene);
+            TerminusId = TerminusEntity.RuntimeId;
+            SetTerminusFlag(TerminusEntity);
+            await Scene.EntityComponent.TransferIn(TerminusEntity);
+        }
+        else
+        {
+            await Scene.EntityComponent.TransferIn(this);
+        }
+        
+        // 然后要解锁下漫游
+        return await UnLock();
+    }
+
+    /// <summary>
+    /// 锁定漫游当执行锁定了后，所有消息都会被暂时放入队列中不会发送。
+    /// 必须要解锁后才能继续发送消息。
+    /// </summary>
+    /// <returns></returns>
+    private async FTask<uint> Lock()
+    {
+        using var response = await Scene.NetworkMessagingComponent.Call(ForwardSceneAddress,
+            new I_LockTerminusIdRequest()
+            {
+                RoamingId = Id,
+                RoamingType = RoamingType
+            });
+        return response.ErrorCode;
+    }
+    
+    /// <summary>
+    /// 解锁漫游
+    /// </summary>
+    /// <returns></returns>
+    private async FTask<uint> UnLock()
+    {
+        using var response = await Scene.NetworkMessagingComponent.Call(ForwardSceneAddress,
+            new I_UnLockTerminusIdRequest()
+            {
+                RoamingId = Id,
+                RoamingType = RoamingType,
+                TerminusId = TerminusId,
+                TargetSceneAddress = Scene.Address
+            });
+        return response.ErrorCode;
+    }
+
+    #endregion
+
+    #region Message
+
+    private async FTask<long> GetTerminusId(int roamingType)
+    {
+        if (IsDisposed)
+        {
+            return 0;
+        }
+
+        using var response = (I_GetTerminusIdResponse)await Scene.NetworkMessagingComponent.Call(
+            ForwardSceneAddress,
+            new I_GetTerminusIdRequest()
+            {
+                RoamingId = Id,
+                RoamingType = roamingType
+            });
+        return response.TerminusId;
+    }
+
+    /// <summary>
+    /// 发送一个消息给客户端
+    /// </summary>
+    /// <param name="message"></param>
+    public void Send<T>(T message) where T : IRoamingMessage
+    {
+        if (StopForwarding)
+        {
+            message.Dispose();
+            return;
+        }
+        
+        Scene.NetworkMessagingComponent.Send(ForwardSessionAddress, message);
+    }
+    
+    /// <summary>
+    /// 发送一个漫游消息
+    /// </summary>
+    /// <param name="roamingType"></param>
+    /// <param name="message"></param>
+    public void Send<T>(int roamingType, T message) where T : IRoamingMessage
+    {
+        SendAsync(roamingType, message).Coroutine();
+    }
+    
+    private async FTask SendAsync<T>(int roamingType, T message) where T : IRoamingMessage
+    {
+        using var response = await Call(roamingType, message);
+    }
+
+    /// <summary>
+    /// 发送一个漫游RPC消息。
+    /// </summary>
+    /// <param name="roamingType"></param>
+    /// <param name="request"></param>
+    /// <returns></returns>
+    public async FTask<IResponse> Call<T>(int roamingType, T request) where T : IRoamingMessage
+    {
+        var protocolCode = request.OpCode();
+
+        if (IsDisposed)
+        {
+            request.Dispose();
+            return null;
+        }
+        
+        var scene = Scene;
+        var messageDispatcherComponent = scene.MessageDispatcherComponent;
+        
+        if (roamingType == RoamingType)
+        {
+            request.Dispose();
+
+            Log.Warning(
+                $"Does not support sending messages to the same scene as roamingType " +
+                $"currentRoamingType:{RoamingType} roamingType:{roamingType}");
+
+            return messageDispatcherComponent.CreateResponse(
+                protocolCode,
+                InnerErrorCode.ErrNotFoundRoaming);
+        }
+        
+        var failCount = 0;
+        var runtimeId = RuntimeId;
+        var requestType = typeof(T);
+        var timerComponent = scene.TimerComponent;
+        var roamingMessageLock = RoamingMessageLock!;
+        var networkMessagingComponent = scene.NetworkMessagingComponent;
+        
+        _roamingTerminusId.TryGetValue(roamingType, out var address);
+
+        var buffer = networkMessagingComponent.Pack(request);
+
+        try
+        {
+            using (await roamingMessageLock.Wait(roamingType, "Terminus Call request"))
+            {
+                while (runtimeId == RuntimeId)
+                {
+                    if (address == 0)
+                    {
+                        address = await GetTerminusId(roamingType);
+
+                        if (runtimeId != RuntimeId)
+                        {
+                            return messageDispatcherComponent.CreateResponse(
+                                protocolCode,
+                                InnerErrorCode.ErrRoamingDisposed);
+                        }
+                        
+                        if (address != 0)
+                        {
+                            _roamingTerminusId[roamingType] = address;
+                        }
+                        else
+                        {
+                            return messageDispatcherComponent.CreateResponse(
+                                protocolCode,
+                                InnerErrorCode.ErrRoamingNotReady);
+                        }
+                    }
+                    
+                    var iRouteResponse = await networkMessagingComponent.Call(
+                        address,
+                        requestType,
+                        protocolCode,
+                        buffer);
+                    
+                    if (runtimeId != RuntimeId)
+                    {
+                        iRouteResponse.ErrorCode = InnerErrorCode.ErrRoamingTimeout;
+                        return iRouteResponse;
+                    }
+
+                    switch (iRouteResponse.ErrorCode)
+                    {
+                        case InnerErrorCode.ErrRouteTimeout:
+                        case InnerErrorCode.ErrRoamingTimeout:
+                        {
+                            return iRouteResponse;
+                        }
+                        case InnerErrorCode.ErrNotFoundRoute:
+                        case InnerErrorCode.ErrNotFoundRoaming:
+                        {
+                            if (++failCount > RoamingConstants.MaxRetryCount)
+                            {
+                                Log.Error(
+                                    $"Terminus.Call failCount > " +
+                                    $"{RoamingConstants.MaxRetryCount} route send message fail, " +
+                                    $"TerminusId: {address}");
+
+                                return iRouteResponse;
+                            }
+
+                            try
+                            {
+                                await timerComponent.Net.WaitAsync(
+                                    RoamingConstants.RetryIntervalMs);
+                            }
+                            catch
+                            {
+                                iRouteResponse.Dispose();
+                                throw;
+                            }
+
+                            if (runtimeId != RuntimeId)
+                            {
+                                iRouteResponse.ErrorCode =
+                                    InnerErrorCode.ErrRoamingDisposed;
+
+                                return iRouteResponse;
+                            }
+
+                            iRouteResponse.Dispose();
+                            address = 0;
+                            continue;
+                        }
+                        default:
+                        {
+                            return iRouteResponse;
+                        }
+                    }
+                }
+            }
+            
+            return messageDispatcherComponent.CreateResponse(
+                protocolCode,
+                InnerErrorCode.ErrRoamingDisposed);
+        }
+        finally
+        {
+            networkMessagingComponent.MemoryStreamBufferPool.ReturnMemoryStream(buffer);
+        }
+    }
+
+    #endregion
+}
+#endif
